@@ -26,19 +26,85 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+// TODO: we need to implement exclusiove scan.
+// we should have 2 parts:
+// 1 part for up-prop
+// 2nd part for down-prop
+// bullshit
+// we will use thread synchronization and memory barriers.
+__global__ void upscan_kernel(int *device_data, int stride, int length) {
+    // it's simple math,  we just calculate the stride from the thread indexes    
+    // we will need to use the kernel idx.
+    int arrayIdx1 = 2 * stride * (blockIdx.x * blockDim.x + threadIdx.x)
+        + stride - 1;
+    int arrayIdx2 = arrayIdx1 + stride;
+    if (arrayIdx1 >= length || arrayIdx2 >= length) {
+        return;
+    }
+    device_data[arrayIdx2] += device_data[arrayIdx1];
+    return;
+}
+
+
+__global__ void downscan_kernel(int *device_data, int stride, int length) {
+    int arrayIdx1 = 2 * stride * (blockIdx.x * blockDim.x + threadIdx.x)
+        + stride - 1;
+    int arrayIdx2 = arrayIdx1 + stride;
+    if (arrayIdx1 >= length || arrayIdx2 >= length) {
+        return;
+    }
+    int temp_val = device_data[arrayIdx2];
+    device_data[arrayIdx2] += device_data[arrayIdx1];
+    device_data[arrayIdx1] = temp_val;
+    return;
+}
+
+// I think we can do it per thread-block.
 void exclusive_scan(int *device_data, int length) {
-    /* TODO
-     * Fill in this function with your exclusive scan implementation.
-     * You are passed the locations of the data in device memory
-     * The data are initialized to the inputs.  Your code should
-     * do an in-place scan, generating the results in the same array.
-     * This is host code -- you will need to declare one or more CUDA
-     * kernels (with the __global__ decorator) in order to actually run code
-     * in parallel on the GPU.
-     * Note you are given the real length of the array, but may assume that
-     * both the data array is sized to accommodate the next
-     * power of 2 larger than the input.
-     */
+    int rounded_length = nextPow2(length);
+    // okay
+    // device data.
+    int stride = 1;
+
+    // printf("up-prop\n");
+    // use up-prop kernel :)
+    while (2 * stride < rounded_length) {
+        // TODO: how do we divide the work
+        // we need to set blockIdx.x and threadIdx.x
+        int threadsPerBlock = 512;
+        // stride 2 * stride is the number of units
+        int numThreads = (rounded_length + 2 * stride - 1) / (2 * stride);
+        int blocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+        // printf("numThreads: %d, stride: %d, length: %d\n", 
+        //         numThreads, stride, length);
+
+        upscan_kernel<<<blocks, threadsPerBlock>>>(device_data, 
+                stride, rounded_length);
+        cudaDeviceSynchronize();
+        stride *= 2;
+    }
+    // we need to be extra sure about the indices
+
+    // cudamemset last element to 0
+    // FUCK NO WONDER!!!
+    // WE DID NOT DO THIS!!!
+    cudaMemset(device_data + rounded_length - 1, 0, sizeof(int)); 
+
+    // printf("down-prop\n");
+    // use down-prop  kernel
+    while (stride > 0) {
+        // TODO: how do we divide the work
+        int threadsPerBlock = 512;
+        int numThreads = (rounded_length + 2 * stride - 1) / (2 * stride);
+        int blocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+        // printf("numThreads: %d, stride: %d, length: %d\n", 
+        //         numThreads, stride, length);
+        downscan_kernel<<<blocks, threadsPerBlock>>>(device_data, stride,
+                rounded_length);
+        cudaDeviceSynchronize();
+        stride /= 2;
+    }
+    return;
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -71,6 +137,7 @@ double cudaScan(int *inarray, int *end, int *resultarray) {
     return overallDuration;
 }
 
+
 /* Wrapper around the Thrust library's exclusive scan function
  * As above, copies the input onto the GPU and times only the execution
  * of the scan itself.
@@ -98,22 +165,75 @@ double cudaScanThrust(int *inarray, int *end, int *resultarray) {
     return overallDuration;
 }
 
+__global__ void is_peak(int *device_data, int *result, int length) {
+    int arrayIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    // specification
+    if (arrayIdx < 0 || arrayIdx >= length) {
+        return;
+    }
+
+    if (arrayIdx == 0 || arrayIdx == length - 1) {
+        result[arrayIdx] = 0;
+        return;
+    }
+
+    if (device_data[arrayIdx - 1] < device_data[arrayIdx] &&
+            device_data[arrayIdx + 1] < device_data[arrayIdx]) {
+        result[arrayIdx] = 1;
+        return;
+    }
+    result[arrayIdx] = 0;
+
+    return;
+}
+
+__global__ void reverse_peak_mapping(int *input, int *result, int length) {
+    // input is reverse mapping.
+    int arrayIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (arrayIdx <= 0 || arrayIdx >= length - 1) {
+        return;
+    }
+
+    if (input[arrayIdx] < input[arrayIdx + 1]) {
+        result[input[arrayIdx]] = arrayIdx;
+    }
+
+    return;
+    // specification
+}
+
 int find_peaks(int *device_input, int length, int *device_output) {
-    /* TODO:
-     * Finds all elements in the list that are greater than the elements before and after,
-     * storing the index of the element into device_result.
-     * Returns the number of peak elements found.
-     * By definition, neither element 0 nor element length-1 is a peak.
-     *
-     * Your task is to implement this function. You will probably want to
-     * make use of one or more calls to exclusive_scan(), as well as
-     * additional CUDA kernel launches.
-     * Note: As in the scan code, we ensure that allocated arrays are a power
-     * of 2 in size, so you can use your exclusive_scan function with them if
-     * it requires that. However, you must ensure that the results of
-     * find_peaks are correct given the original length.
-     */
-    return 0;
+    int roundedLength = nextPow2(length);
+
+    int *isPeaksArray;
+    cudaMalloc((void **)&isPeaksArray, roundedLength * sizeof(int));
+
+
+    int threadsPerBlock = 512;
+    int numThreads = roundedLength;
+    int blocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+    
+    // find_peaks.
+    is_peak<<<blocks, threadsPerBlock>>>(device_input, isPeaksArray, length);
+
+    cudaDeviceSynchronize();
+
+    // scan booleans  to understand where the peaks are
+    exclusive_scan(isPeaksArray, length);
+    reverse_peak_mapping<<<blocks, threadsPerBlock>>>(isPeaksArray,
+            device_output, length);
+    cudaDeviceSynchronize();
+    int size;
+    //  this is the fault
+    // cudaMemcpy(&size, (isPeaksArray + length - 1), 
+    //         sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&size, (isPeaksArray + length - 1), sizeof(int), 
+            cudaMemcpyDeviceToHost);
+    cudaFree(isPeaksArray);
+
+    // TODO: we need to reverse map the integers
+    return size;
 }
 
 /* Timing wrapper around find_peaks. You should not modify this function.

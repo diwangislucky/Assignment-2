@@ -118,11 +118,17 @@ int main(int argc, char **argv) {
             inarray[i] = val;
             checkarray[i] = val;
         }
+        //for (int i = 0; i < N; i++) {
+        //    printf("inarray[%d] = %d\n", i, inarray[i]);
+        //}
+        //printf("\n");
     } else {
         // Fixed test case - you may find this useful for debugging
         for (int i = 0; i < N; i++) {
-            inarray[i] = i % 2;
-            checkarray[i] = i % 2;
+            inarray[i] = i;
+            checkarray[i] = i;
+            // inarray[i] = i % 2;
+            // checkarray[i] = i % 2;
         }
     }
 

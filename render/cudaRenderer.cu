@@ -19,6 +19,24 @@
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, 
+        int line, bool abort=true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+                cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
+
 // This stores the global constants
 struct GlobalConstants {
 
@@ -358,6 +376,7 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p, float4 *imag
 
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
+    // understood.
 
     float4 existingColor = *imagePtr;
     float4 newColor;
@@ -393,6 +412,8 @@ __global__ void kernelRenderCircles() {
     // screen coordinates, so it's clamped to the edges of the screen.
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
+    // we can make these calculations outside of the kernel
+    // and pass the params in.
     short minX = static_cast<short>(imageWidth * (p.x - rad));
     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
     short minY = static_cast<short>(imageHeight * (p.y - rad));
@@ -407,6 +428,7 @@ __global__ void kernelRenderCircles() {
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
+    // TODO; change this
     // For all pixels in the bounding box
     for (int pixelY = screenMinY; pixelY < screenMaxY; pixelY++) {
         float4 *imgPtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
@@ -416,6 +438,154 @@ __global__ void kernelRenderCircles() {
             shadePixel(pixelCenterNorm, p, imgPtr, index);
             imgPtr++;
         }
+    }
+}
+
+#include "circleBoxTest.cu_inl"
+
+// finds inclusive to box.
+__device__ void findInclusive(uint *result, uint idx, uint offset) {
+
+    if (idx + offset >= cuConstRendererParams.numberOfCircles) {
+        result[idx] = 0;
+        return;
+    }
+
+    int idx3 = 3 * (idx + offset);
+
+    // Read position and radius
+    float3 p = *(float3 *)(&cuConstRendererParams.position[idx3]);
+    float rad = cuConstRendererParams.radius[idx + offset];
+
+    // Compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    // we can make these calculations outside of the kernel
+    // and pass the params in.
+    short minX = blockIdx.x * blockDim.x;
+    short maxX = (blockIdx.x + 1) * blockDim.x;
+    short minY = blockIdx.y * blockDim.y;
+    short maxY = (blockIdx.y + 1) * blockDim.y;
+
+    // A bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    // TODO: we need clamps here.
+    float boxL = invWidth * (static_cast<float>(screenMinX) + 0.5f);
+    float boxR = invWidth * (static_cast<float>(screenMaxX) + 0.5f);
+    float boxT = invHeight * (static_cast<float>(screenMaxY) + 0.5f);
+    float boxB = invHeight * (static_cast<float>(screenMinY) + 0.5f);
+    result[idx] = circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+    return;
+}
+
+// the question here is:
+// how do I make sure this works for the first and last circle IDX
+__device__ void reversePeakMapping(uint *input, uint *result, uint length,
+        uint idx) {
+
+    if (idx >= length - 1) {
+        return;
+    }
+
+    if (input[idx] < input[idx + 1]) {
+        result[input[idx]] = idx;
+    }
+
+    return;
+    // specification
+}
+
+
+// TODO: modify signature soon
+__device__ void renderPixel(uint *circleIdxArray, uint length) {
+    // Compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // I might need to clamp
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) {
+        return;
+    }
+    if (pixelX < 0 || pixelY < 0) {
+        return;
+    }
+    // TODO: this is wrong we need to fix
+    float4 *imgPtr = 
+        (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY
+                    * imageWidth + pixelX)]);
+    // TODO: we might need to shade the first and the last pixels
+    for (int i = 0; i < length; ++i) {
+        uint idx = circleIdxArray[i];
+        float2 pixelCenterNorm =
+            make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+        float3 p = *(float3 *)(&cuConstRendererParams.position[3 * idx]);
+        shadePixel(pixelCenterNorm, p, imgPtr, idx);
+    }
+    return;
+}
+
+#define BLOCKSIZE (32 * 32)
+
+#define SCAN_BLOCK_DIM BLOCKSIZE  
+// needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+
+// bare bones edition.
+// no pipelining or anything fancy
+__global__ void kernelRenderPixel() {
+    // obtain peaks for this group of pixels.
+    __shared__ uint prefixSumInput[BLOCKSIZE];
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+
+    uint idx = threadIdx.y * blockDim.y + threadIdx.x;
+    uint numberOfCircles = (uint)cuConstRendererParams.numberOfCircles;
+
+    for (uint offset = 0; offset < numberOfCircles; offset += BLOCKSIZE) {
+        // find peaks.
+        findInclusive(prefixSumInput, idx, offset);
+        __syncthreads();
+
+        // scan
+        sharedMemExclusiveScan(idx, prefixSumInput, prefixSumOutput, 
+                prefixSumScratch, BLOCKSIZE);
+        __syncthreads();
+
+        // blank input for reuse
+        prefixSumInput[idx] = 0;
+        __syncthreads();
+
+        // reverse map
+        reversePeakMapping(prefixSumOutput, prefixSumInput, BLOCKSIZE, idx);
+        int length = prefixSumOutput[BLOCKSIZE - 1];
+        __syncthreads();
+
+        prefixSumInput[idx] += offset;
+        __syncthreads();
+        // this is here just to compensate for the last one being excluded
+        if (offset + BLOCKSIZE - 1 < numberOfCircles) {
+            prefixSumInput[length] = offset + BLOCKSIZE - 1;
+            ++length;
+            __syncthreads();
+        }
+    
+        //  finally  let's  render
+        renderPixel(prefixSumInput, length);
+        // we  need to append
+        __syncthreads();
     }
 }
 
@@ -618,9 +788,14 @@ void CudaRenderer::advanceAnimation() {
 
 void CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+    int imageWidth = image->width;
+    int imageHeight = image->height;
+    dim3 blockDim(32, 32);
+    dim3 gridDim;
+    gridDim.x = (imageWidth + blockDim.x - 1) / blockDim.x;
+    gridDim.y = (imageHeight + blockDim.y - 1) / blockDim.y;
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // this is a bit of a yikes
+    kernelRenderPixel<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
